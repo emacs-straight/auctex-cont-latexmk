@@ -63,10 +63,7 @@
   (let ((error-alist
          (append TeX-error-description-list
                  TeX-error-description-list-local)))
-    (catch 'found
-      (dolist (error error-alist)
-        (when (string-match (car error) message)
-          (throw 'found (cdr error)))))))
+    (alist-get message error-alist nil nil #'string-match-p)))
 
 (defun auctex-cont-latexmk-help-at-point ()
   "Display the AUCTeX help for the error at point."
@@ -81,48 +78,47 @@ The arguments are as in `TeX-error-list'.  Return either nil or a
 triple (ERROR-P DESCRIPTION (BEG . END)), where ERROR-P is non-nil if it
 is an error rather than a warning."
   (or
-   (and
-    (not ignore)
-    (stringp file)
-    (or (not bad-box) TeX-debug-bad-boxes)
-    (when-let
-        ((region
-          (save-restriction
-            (widen)
-            (cond
-             ((file-equal-p
-               file
-               (or buffer-file-name (buffer-file-name (buffer-base-buffer))))
-              (when line
-                (if (eq type 'error)
+   (when-let*
+       (((not ignore))
+        ((stringp file))
+        ((or (not bad-box) TeX-debug-bad-boxes))
+        (region
+         (save-restriction
+           (widen)
+           (cond
+            ((file-equal-p
+              file
+              (or buffer-file-name (buffer-file-name (buffer-base-buffer))))
+             (when line
+               (if (eq type 'error)
+                   (save-excursion
+                     (goto-char (point-min))
+                     (forward-line (+ line offset -1))
+                     (unless (string= search-string " ")
+                       (search-forward search-string nil t)
+                       (cons (point) (1+ (point)))))
+                 (flymake-diag-region (current-buffer) (+ line offset)))))
+            ((file-equal-p file (TeX-master-output-file "aux"))
+             (and auctex-cont-latexmk-report-multiple-labels
+                  (string-match-p "multiply defined" message)
+                  (not (eq type 'error))
+                  (let* ((label (progn
+                                  (string-match "`\\(.*\\)'" message)
+                                  (match-string 1 message)))
+                         (label-re
+                          (concat "\\\\label\\(?:\\[[^]]+\\]\\)?{"
+                                  (regexp-quote label) "}")))
                     (save-excursion
                       (goto-char (point-min))
-                      (forward-line (+ line offset -1))
-                      (unless (string= search-string " ")
-                        (search-forward search-string nil t)
-                        (cons (point) (1+ (point)))))
-                  (flymake-diag-region (current-buffer) (+ line offset)))))
-             ((file-equal-p file (TeX-master-output-file "aux"))
-              (and auctex-cont-latexmk-report-multiple-labels
-                   (string-match-p "multiply defined" message)
-                   (not (eq type 'error))
-                   (let* ((label (progn
-                                   (string-match "`\\(.*\\)'" message)
-                                   (match-string 1 message)))
-                          (label-re
-                           (concat "\\\\label\\(?:\\[[^]]+\\]\\)?{"
-                                   (regexp-quote label) "}")))
-                     (save-excursion
-                       (goto-char (point-min))
-                       (when (re-search-forward label-re nil t)
-                         ;; Return the full line so the diagnostic is
-                         ;; not covered by preview overlays when
-                         ;; \\label appears after \\begin{equation}.
-                         (cons (line-beginning-position)
-                               (line-end-position)))))))))))
-      (list (eq type 'error)
-            (replace-regexp-in-string "\n" "" message)
-            region)))
+                      (when (re-search-forward label-re nil t)
+                        ;; Return the full line so the diagnostic is
+                        ;; not covered by preview overlays when
+                        ;; \\label appears after \\begin{equation}.
+                        (cons (line-beginning-position)
+                              (line-end-position)))))))))))
+     (list (eq type 'error)
+           (replace-regexp-in-string "\n" "" message)
+           region))
    ;; Put errors without file or line at bottom of buffer.
    (when (eq type 'error)
      (list t
@@ -133,9 +129,9 @@ is an error rather than a warning."
   "Format the current log buffer by joining lines suitably.
 Adapted from `TeX-format-filter'."
   (goto-char (point-max))
-  (while (> (point) (point-min))
+  (while (not (bobp))
     (end-of-line 0)
-    (when (and (memq (- (point) (line-beginning-position)) '(79 80))
+    (when (and (<= 79 (current-column) 80)
                (not (memq (char-after (1+ (point))) '(?\n ?\()))
                (not (and (eq (char-before) ?.)
                          (char-after (1+ (point)))
@@ -155,10 +151,11 @@ Adapted from `TeX-format-filter'."
   "Process log file for current LaTeX document.
 Return a list of triples as in the docstring of
 `auctex-cont-latexmk-process-item'."
-  (delq nil
-        (mapcar (lambda (item)
-                  (apply #'auctex-cont-latexmk-process-item item))
-                (auctex-cont-latexmk--error-list (TeX-master-output-file "log")))))
+  (mapcan
+   (lambda (err)
+     (when-let ((item (apply #'auctex-cont-latexmk-process-item err)))
+       (list item)))
+   (auctex-cont-latexmk--error-list (TeX-master-output-file "log"))))
 
 (defvar-local auctex-cont-latexmk--report-fn nil
   "Function provided by Flymake for reporting diagnostics.")
@@ -204,33 +201,35 @@ Flymake report function to propagate to indirect buffers."
 ;;; Continuous Compilation
 
 (defcustom auctex-cont-latexmk-command
-  '("latexmk -pvc -shell-escape -pdf -view=none -e "
+  '("latexmk -pvc -pdf -view=none -e "
     ("$pdflatex=q/pdflatex %O -synctex=1 -interaction=nonstopmode %S/"))
   "Command to compile LaTeX documents.
 This is a list consisting of strings or lists of strings.  It is
-compiled to a single string by concatenating the strings and quoting the
-lists, using system-specific quotes.  To produce the compilation
-command, it is combined with an additional option to output build files
-to a directory (if `TeX-output-dir' is set) and the name of the master
-file."
+compiled to a single string by
+
+ - concatenating the strings, and
+
+ - concatenating the contents of each list and quoting the result as a
+shell argument.
+
+To produce the compilation command, the result is combined with an
+additional option to output build files to a directory (if
+`TeX-output-dir' is set) and the name of the master file."
   :type '(repeat (choice string (repeat string))))
 
 (defun auctex-cont-latexmk--compilation-command ()
   "Return the command used to compile the current LaTeX document."
-  (let ((quote
-         (if (memq system-type '(ms-dos windows-nt))
-             "\""
-           "'")))
-    (concat
-     (mapconcat (lambda (item)
-                  (if (listp item)
-                      (concat quote (mapconcat #'identity item) quote)
-                    item))
-                auctex-cont-latexmk-command)
-     (when TeX-output-dir
-       (concat " -outdir=" (shell-quote-argument TeX-output-dir)))
-     " "
-     (shell-quote-argument (TeX-master-file "tex")))))
+  (concat
+   (mapconcat
+    (lambda (item)
+      (if (listp item)
+          (shell-quote-argument (mapconcat #'identity item))
+        item))
+    auctex-cont-latexmk-command)
+   (when TeX-output-dir
+     (concat " -outdir=" (shell-quote-argument TeX-output-dir)))
+   " "
+   (shell-quote-argument (TeX-master-file "tex"))))
 
 (defun auctex-cont-latexmk--compilation-buffer-name ()
   "Return the name of the buffer used for LaTeX compilation."
@@ -259,7 +258,13 @@ file."
 This is the case if the current buffer is not modified, the current
 buffer is a file, the current buffer has a log file, the log file is
 newer than the current buffer, and the current latexmk compilation is
-either in a watching state or has not updated recently."
+either in a watching state or has not updated recently.
+
+The reason we check if the latexmk has not been updated recently is
+because it seems that on Windows, the latexmk script doesn't always
+display the most recent message.  I haven't been able to debug why this
+is the case.  Checking that the compilation has not been updated
+recently serves as a workaround."
   (when-let* ((file
                (or buffer-file-name (buffer-file-name (buffer-base-buffer))))
               (log-file (TeX-master-output-file "log")))
@@ -270,8 +275,9 @@ either in a watching state or has not updated recently."
           (progn
             (goto-char (point-max))
             (forward-line -1)
-            (equal (buffer-substring (point) (line-end-position))
-                   auctex-cont-latexmk--watching-str))
+            (re-search-forward
+             (rx (literal auctex-cont-latexmk--watching-str) (? ?\n) eos)
+             nil t))
           (and (or
                 auctex-cont-latexmk--last-update-time
                 (time-less-p (time-subtract (current-time)
@@ -311,12 +317,8 @@ empty, except when NOKILL is non-nil."
         (when (null auctex-cont-latexmk--subscribed-buffers)
           (setq done t)))
       (when done
-        (let ((process (get-buffer-process comp-buf)))
-          (when (process-live-p process)
-            (interrupt-process process)
-            (sit-for 0.1)
-            (delete-process process))
-          (unless nokill
+        (unless nokill
+          (let ((kill-buffer-query-functions nil)) ; don't ask to kill process
             (kill-buffer comp-buf)))))))
 
 (defvar-local auctex-cont-latexmk--disable-function nil
@@ -390,7 +392,7 @@ Saved and restored by `auctex-cont-latexmk-toggle'.")
 (defcustom auctex-cont-latexmk-retained-flymake-backends
   '(eglot-flymake-backend)
   "Flymake backends to retain when enabling `auctex-cont-latexmk-mode'."
-  :type 'boolean)
+  :type '(repeat symbol))
 
 (defun auctex-cont-latexmk-turn-on ()
   "Enable `auctex-cont-latexmk-mode' and set up Flymake."
@@ -425,10 +427,9 @@ Saved and restored by `auctex-cont-latexmk-toggle'.")
 (defun auctex-cont-latexmk-toggle ()
   "Toggle `auctex-cont-latexmk-mode' and its Flymake backend."
   (interactive)
-  (cond (auctex-cont-latexmk-mode
-         (auctex-cont-latexmk-turn-off))
-        (t
-         (auctex-cont-latexmk-turn-on))))
+  (if auctex-cont-latexmk-mode
+      (auctex-cont-latexmk-turn-off)
+    (auctex-cont-latexmk-turn-on)))
 
 (provide 'auctex-cont-latexmk)
 ;;; auctex-cont-latexmk.el ends here
